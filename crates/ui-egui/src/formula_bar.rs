@@ -8,6 +8,9 @@ use crate::editor::{REF_COLORS, formula_refs};
 use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 
+/// Keys the editor fields keep for themselves (egui would otherwise move focus with them).
+const EDIT_KEYS: egui::EventFilter = egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true };
+
 pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let expanded = app.ui.formula_bar_expanded;
@@ -329,13 +332,17 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         .desired_width(width)
         .layouter(&mut layouter)
         .lock_focus(true)
-        .event_filter(egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true })
+        .event_filter(EDIT_KEYS)
         .show(ui);
     let resp = output.response.clone();
     let synced = mine && (ed.request_focus || ed.sync_caret);
     if synced {
         if ed.request_focus {
             resp.request_focus();
+            // Taking focus resets the keys the field keeps for itself: keep Tab and Escape (they
+            // end the edit), or a Tab typed before the next frame would also move focus to the
+            // next widget and the key after it would go nowhere.
+            ui.memory_mut(|m| m.set_focus_lock_filter(id, EDIT_KEYS));
         }
         ed.request_focus = false;
         ed.sync_caret = false;

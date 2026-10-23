@@ -299,6 +299,30 @@ pub struct SheetApp {
     /// The others editing this workbook together with this person (live co-editing), drawn as
     /// a coloured frame with their name on the cells they have selected.
     pub peers: Vec<RemotePeer>,
+    /// Input held back for the next frame (see [`SheetApp::raw_input_hook`]).
+    typed_ahead: Vec<egui::Event>,
+    /// An editor was open at the last input hook.
+    editor_seen: bool,
+}
+
+/// Where one frame's input should stop so that typed keys reach the right cell: after a key that
+/// commits or leaves an edit (Enter, Tab, Escape, an arrow), and after the first character that
+/// starts one. `None` when everything can go in this frame.
+fn typing_cut(events: &[egui::Event], starts_edit: bool) -> Option<usize> {
+    use egui::Key;
+    let cut = events.iter().position(|e| match e {
+        egui::Event::Key { key, pressed: true, .. } => {
+            matches!(key, Key::Enter | Key::Tab | Key::Escape | Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight)
+        }
+        egui::Event::Text(t) => starts_edit && !t.is_empty(),
+        _ => false,
+    })?;
+    // The key's release (and anything else that is not input of its own) stays with it.
+    let mut end = cut + 1;
+    while events.get(end).is_some_and(|e| matches!(e, egui::Event::Key { pressed: false, .. })) {
+        end += 1;
+    }
+    (end < events.len()).then_some(end)
 }
 
 /// Someone else editing the same workbook live: where they are, for this person's grid.
@@ -361,6 +385,8 @@ impl SheetApp {
             started: now_ms(),
             allow_close: false,
             peers: Vec::new(),
+            typed_ahead: Vec::new(),
+            editor_seen: false,
         }
     }
 
@@ -1165,6 +1191,9 @@ impl SheetApp {
 
     /// Per-frame logic (control channel, screenshots). Call before `ui`.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        if !self.typed_ahead.is_empty() {
+            ctx.request_repaint();
+        }
         if self.session.text_width.is_none() {
             let ctx = ctx.clone();
             self.session.text_width = Some(std::sync::Arc::new(move |text, font, exact| theme::cell_text_width(&ctx, text, font, exact)));
@@ -1276,6 +1305,27 @@ impl SheetApp {
     pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
         if let Some(mut batch) = self.synthetic.pop_front() {
             raw.events.append(&mut batch);
+        }
+        // Keys typed faster than the app draws (a slow frame on a phone, with software graphics,
+        // or while others edit the workbook too) arrive together. The editor commits on Tab and
+        // Enter before it takes the frame's text, so each frame gets the keys up to the first one
+        // that starts or ends an edit; the rest wait for the next frame, in order.
+        if !self.typed_ahead.is_empty() {
+            let mut events = std::mem::take(&mut self.typed_ahead);
+            events.append(&mut raw.events);
+            raw.events = events;
+            // An edit those keys started last frame takes the keyboard only now: give its field
+            // this frame to take focus before more keys reach it.
+            if self.editor.is_some() && !self.editor_seen {
+                self.editor_seen = true;
+                self.typed_ahead = std::mem::take(&mut raw.events);
+                return;
+            }
+        }
+        self.editor_seen = self.editor.is_some();
+        let starts_edit = self.editor.is_none() && self.text_box_editor.is_none() && self.dialog.is_none();
+        if let Some(cut) = typing_cut(&raw.events, starts_edit) {
+            self.typed_ahead = raw.events.split_off(cut);
         }
     }
 
