@@ -1,6 +1,11 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::Arc;
+
 use gridcraft_engine::Session;
+use gridcraft_engine::model::Workbook;
 use gridcraft_ui_egui::{Inbox, Services, SheetApp};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
@@ -54,7 +59,8 @@ pub fn start() {
                     } else if q.contains("sample") {
                         let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
                     }
-                    let mut services = services(inbox.clone(), cc.egui_ctx.clone());
+                    let portal_saves = PortalSaves::default();
+                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), portal_saves.clone());
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     }
@@ -82,7 +88,26 @@ pub fn start() {
                         }
                         bridge.post_ready();
                     }
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs }))
+                    // OfficeHub: open the workbook the portal asked for (it arrives through the inbox).
+                    let opened = Rc::new(Cell::new(false));
+                    let portal = if app_bridge.is_none() { crate::portal::source() } else { None };
+                    if let Some((src, name)) = portal {
+                        let inbox = inbox.clone();
+                        let ctx = cc.egui_ctx.clone();
+                        let opened = opened.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match crate::portal::fetch(&src, "GET", None).await {
+                                Ok(bytes) => {
+                                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                                    opened.set(true);
+                                    ctx.request_repaint();
+                                }
+                                Err(e) => log::error!("couldn't open the workbook from OfficeHub: {e}"),
+                            }
+                        });
+                    }
+                    let live = if app_bridge.is_none() { crate::live::Live::from_portal(opened) } else { None };
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs, portal_saves, saving: Vec::new(), live, sized: false }))
                 }),
             )
             .await;
@@ -111,7 +136,88 @@ struct WebShell {
     inbox: Inbox,
     bridge: Option<crate::host::Bridge>,
     prefs: crate::prefs::PrefsSync,
+    /// OfficeHub: saves sent back to the portal.
+    portal_saves: PortalSaves,
+    /// The workbook as each portal save in flight sent it (by ticket): it counts as saved once
+    /// the portal has it.
+    saving: Vec<(u64, Arc<Workbook>)>,
+    /// OfficeHub: editing together with others (`?collab=`).
+    live: Option<crate::live::Live>,
+    /// The view was fitted to a narrow screen (a phone) once.
+    sized: bool,
 }
+
+/// OfficeHub saves: the tickets started since the last frame and the ones the portal answered.
+#[derive(Clone, Default)]
+struct PortalSaves {
+    next: Rc<Cell<u64>>,
+    started: Rc<RefCell<Vec<u64>>>,
+    done: Rc<RefCell<Vec<(u64, Result<(), String>)>>>,
+}
+
+impl PortalSaves {
+    /// Send the workbook back to the portal, which keeps it as the file's next version.
+    fn send(&self, ctx: &egui::Context, url: String, bytes: &[u8]) {
+        let ticket = self.next.get().wrapping_add(1);
+        self.next.set(ticket);
+        self.started.borrow_mut().push(ticket);
+        let done = self.done.clone();
+        let ctx = ctx.clone();
+        let bytes = bytes.to_vec();
+        wasm_bindgen_futures::spawn_local(async move {
+            let outcome = crate::portal::fetch(&url, "PUT", Some(&bytes)).await.map(|_| ());
+            done.borrow_mut().push((ticket, outcome));
+            ctx.request_repaint();
+        });
+    }
+
+    /// After each frame: note what each new save sent, and mark the workbook saved (or say why
+    /// not) once the portal has answered.
+    fn sync(&self, app: &mut SheetApp, saving: &mut Vec<(u64, Arc<Workbook>)>) {
+        for ticket in std::mem::take(&mut *self.started.borrow_mut()) {
+            if let Some(d) = app.session.active() {
+                saving.push((ticket, d.wb.clone()));
+            }
+        }
+        for (ticket, outcome) in std::mem::take(&mut *self.done.borrow_mut()) {
+            let Some(at) = saving.iter().position(|(t, _)| *t == ticket) else { continue };
+            let (_, wb) = saving.remove(at);
+            match outcome {
+                Ok(()) => {
+                    if let Some(d) = app.session.active_mut() {
+                        d.saved = wb;
+                    }
+                }
+                Err(e) => {
+                    log::error!("{e}");
+                    app.message = Some(("OfficeHub".into(), e));
+                }
+            }
+        }
+    }
+}
+
+/// eframe can leave the canvas at its size in CSS pixels on screens with more than one pixel per
+/// point (phones, Retina displays): the interface is then drawn several times too large and cut
+/// off. Keep the canvas at its size in device pixels (a pixel or two of rounding is left alone).
+fn fit_canvas(ctx: &egui::Context) {
+    let Some(window) = web_sys::window() else { return };
+    let Some(canvas) = window.document().and_then(|d| d.get_element_by_id(CANVAS_ID)).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+    else {
+        return;
+    };
+    let dpr = window.device_pixel_ratio();
+    let want = |css: i32| (f64::from(css.max(0)) * dpr).round() as u32;
+    let (w, h) = (want(canvas.client_width()), want(canvas.client_height()));
+    if w > 0 && h > 0 && (canvas.width().abs_diff(w) > 2 || canvas.height().abs_diff(h) > 2) {
+        canvas.set_width(w);
+        canvas.set_height(h);
+        ctx.request_repaint();
+    }
+}
+
+/// Screens narrower than this (in points) are phones.
+const NARROW: f32 = 700.0;
 
 fn local_storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
@@ -124,6 +230,14 @@ fn stored(key: &str) -> Option<String> {
 
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        fit_canvas(ctx);
+        if !self.sized && ctx.content_rect().width() > 1.0 {
+            self.sized = true;
+            // Like Excel on a phone: the ribbon folded, so the cells get the room.
+            if ctx.content_rect().width() < NARROW {
+                self.app.ui.ribbon_collapsed = true;
+            }
+        }
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
         for f in dropped {
             let inbox = self.inbox.clone();
@@ -140,6 +254,9 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx);
+        if let Some(live) = self.live.as_mut() {
+            live.frame(&mut self.app, ctx);
+        }
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#1562).
         let changed = self.prefs.changed(&self.app);
         if !changed.is_empty() {
@@ -162,14 +279,16 @@ impl eframe::App for WebShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        self.portal_saves.sync(&mut self.app, &mut self.saving);
         if let Some(bridge) = &self.bridge {
             bridge.sync(&mut self.app);
         }
     }
 }
 
-fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, portal_saves: PortalSaves) -> Services {
     let open_inbox = inbox.clone();
+    let save_ctx = ctx.clone();
     let picture_ctx = ctx.clone();
     Services {
         copy_html: Some(Box::new(copy_html)),
@@ -200,9 +319,13 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
-                log::error!("download of {name} failed: {e}");
+        // OfficeHub: saving the opened workbook sends it back to the portal; exports download.
+        download: Some(Box::new(move |name: &str, bytes: &[u8]| match crate::portal::save_target(name) {
+            Some(url) => portal_saves.send(&save_ctx, url, bytes),
+            None => {
+                if let Err(e) = download(name, bytes) {
+                    log::error!("download of {name} failed: {e}");
+                }
             }
         })),
         print: Some(Box::new(|bytes: &[u8]| {

@@ -871,6 +871,7 @@ fn paint_panes(
         let p = painter.with_clip_rect(*clip);
         paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cf, t);
         paint_selection(&p, geo, sh, sel, outline, t, app, *rows, *cols);
+        paint_peers(&p, geo, si, sh, app, *rows, *cols);
     }
     // Freeze lines.
     if geo.fr > 0 {
@@ -880,6 +881,41 @@ fn paint_panes(
         painter.line_segment([pos2(split.x, geo.cells.top()), pos2(split.x, geo.cells.bottom())], Stroke::new(1.0, Color32::from_gray(150)));
     }
     quads
+}
+
+/// The others editing live: a frame in each person's colour around what they selected, their
+/// active cell drawn stronger, and their name on a small tag above it.
+fn paint_peers(p: &Painter, geo: &Geo, si: usize, sh: &Sheet, app: &SheetApp, rows: (u32, u32), cols: (u32, u32)) {
+    for peer in app.peers.iter().filter(|peer| peer.sheet == Some(si)) {
+        let [r, g, b] = peer.color;
+        let col = Color32::from_rgb(r, g, b);
+        if let Some(range) = peer.range
+            && range_in_pane(range, rows, cols)
+        {
+            let rr = geo.range_rect(sh, range);
+            p.rect_filled(rr, 0.0, col.gamma_multiply(0.08));
+            p.rect_stroke(rr, 0.0, Stroke::new(1.5, col), StrokeKind::Inside);
+        }
+        let Some(cell) = peer.cell else { continue };
+        let range = sh.merge_at(cell).unwrap_or_else(|| RangeRef::cell(cell));
+        if !range_in_pane(range, rows, cols) {
+            continue;
+        }
+        let cr = geo.range_rect(sh, range);
+        p.rect_stroke(cr, 0.0, Stroke::new(2.0, col), StrokeKind::Inside);
+        let name: String = peer.name.chars().take(40).collect();
+        if name.is_empty() {
+            continue;
+        }
+        let font = FontId::proportional(11.0);
+        let galley = p.layout_no_wrap(name, font, ink_on(col));
+        let size = galley.size() + vec2(8.0, 2.0);
+        // Above the cell, or below it on the top row (the headings would cover it).
+        let top = if cr.top() - size.y < p.clip_rect().top() { cr.bottom() } else { cr.top() - size.y };
+        let tag = Rect::from_min_size(pos2(cr.left(), top), size);
+        p.rect_filled(tag, 2.0, col);
+        p.galley(tag.min + vec2(4.0, 1.0), galley, col);
+    }
 }
 
 /// The worksheet is painted virtually, so it needs its own scrollbar rather than a

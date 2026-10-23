@@ -13,10 +13,17 @@
 //! workbook to open and stores what GridCraft saves (`host`), and `&author=` names the user for
 //! notes and comments. Preferences (theme, interface size, editing options…) are kept in
 //! `localStorage` (`prefs`).
+//!
+//! OfficeHub (`portal`, `live`): `?src=&save=&name=` opens a workbook from the portal and saves it
+//! back there; `&collab=` edits it together with others, live, with their selections shown.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
 mod host;
+#[cfg(target_arch = "wasm32")]
+mod live;
+#[cfg(target_arch = "wasm32")]
+mod portal;
 #[cfg(any(target_arch = "wasm32", test))]
 mod prefs;
 #[cfg(target_arch = "wasm32")]

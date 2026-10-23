@@ -296,6 +296,21 @@ pub struct SheetApp {
     /// Every unsaved workbook has been answered for quitting (or `app.quit` asked): the next
     /// window close goes through.
     pub allow_close: bool,
+    /// The others editing this workbook together with this person (live co-editing), drawn as
+    /// a coloured frame with their name on the cells they have selected.
+    pub peers: Vec<RemotePeer>,
+}
+
+/// Someone else editing the same workbook live: where they are, for this person's grid.
+#[derive(Clone, Debug, Default)]
+pub struct RemotePeer {
+    pub name: String,
+    pub color: [u8; 3],
+    /// The sheet they are on (index in this workbook), if it is known here.
+    pub sheet: Option<usize>,
+    /// Their active cell and selected range.
+    pub cell: Option<CellRef>,
+    pub range: Option<RangeRef>,
 }
 
 impl SheetApp {
@@ -342,6 +357,7 @@ impl SheetApp {
             tab_run: None,
             started: now_ms(),
             allow_close: false,
+            peers: Vec::new(),
         }
     }
 
