@@ -311,6 +311,9 @@ pub struct RemotePeer {
     /// Their active cell and selected range.
     pub cell: Option<CellRef>,
     pub range: Option<RangeRef>,
+    /// Their name shows until this time (`egui` input time), a moment after they moved; and
+    /// while the pointer rests on their cell. Otherwise it would cover the cell above.
+    pub label_until: f64,
 }
 
 impl SheetApp {

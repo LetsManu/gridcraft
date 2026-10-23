@@ -884,7 +884,8 @@ fn paint_panes(
 }
 
 /// The others editing live: a frame in each person's colour around what they selected, their
-/// active cell drawn stronger, and their name on a small tag above it.
+/// active cell drawn stronger, and their name on a small tag above it for a moment after they
+/// move (and while the pointer rests on their cell), like other spreadsheets that edit together.
 fn paint_peers(p: &Painter, geo: &Geo, si: usize, sh: &Sheet, app: &SheetApp, rows: (u32, u32), cols: (u32, u32)) {
     for peer in app.peers.iter().filter(|peer| peer.sheet == Some(si)) {
         let [r, g, b] = peer.color;
@@ -903,6 +904,13 @@ fn paint_peers(p: &Painter, geo: &Geo, si: usize, sh: &Sheet, app: &SheetApp, ro
         }
         let cr = geo.range_rect(sh, range);
         p.rect_stroke(cr, 0.0, Stroke::new(2.0, col), StrokeKind::Inside);
+        let (now, hover) = p.ctx().input(|i| (i.time, i.pointer.hover_pos()));
+        let hovered = hover.is_some_and(|h| cr.contains(h));
+        if now < peer.label_until {
+            p.ctx().request_repaint_after(std::time::Duration::from_secs_f64((peer.label_until - now).max(0.05)));
+        } else if !hovered {
+            continue;
+        }
         let name: String = peer.name.chars().take(40).collect();
         if name.is_empty() {
             continue;

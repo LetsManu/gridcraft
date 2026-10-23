@@ -123,7 +123,10 @@ impl Live {
         }
         self.pump(ctx);
         self.autosave(app, ctx, now);
-        // The others, on this workbook's sheets (a sheet someone added only now is known now).
+        // The others, on this workbook's sheets (a sheet someone added only now is known now). A
+        // name shows for a moment after its person moved.
+        const LABEL_SECONDS: f64 = 3.0;
+        let previous = std::mem::take(&mut app.peers);
         app.peers = self
             .shared
             .borrow()
@@ -134,6 +137,11 @@ impl Live {
                 p.sheet = state["sheet"].as_str().and_then(|id| app.session.collab_sheet_index(id));
                 p.cell = state["cell"].as_str().and_then(CellRef::parse);
                 p.range = state["range"].as_str().and_then(RangeRef::parse);
+                let before = previous.iter().find(|o| o.name == p.name && o.color == p.color);
+                p.label_until = match before {
+                    Some(o) if o.sheet == p.sheet && o.cell == p.cell => o.label_until,
+                    _ => now + LABEL_SECONDS,
+                };
                 p
             })
             .collect();
