@@ -11,6 +11,7 @@ pub mod cf;
 mod chart_svg;
 mod clip_html;
 pub mod cmd;
+mod collab;
 pub mod display;
 pub mod fill;
 pub mod io;
@@ -33,6 +34,8 @@ use serde_json::Value as Json;
 
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command, register_test_command};
 pub use gridcraft_calc as calc;
+/// Several live co-editing updates as one (to send them together).
+pub use gridcraft_collab::merge as collab_merge;
 pub use gridcraft_core as core;
 pub use gridcraft_formula as formula;
 pub use gridcraft_model as model;
@@ -323,6 +326,8 @@ pub struct Session {
     /// Measures cell text for AutoFit Column Width. Without it (CLI, MCP) AutoFit uses
     /// [`cmd::format::approx_text_width`].
     pub text_width: Option<TextWidth>,
+    /// Editing together with others (OfficeHub): the live session, if any.
+    pub(crate) collab: Option<Box<collab::Live>>,
 }
 
 impl Session {
@@ -415,6 +420,10 @@ impl Session {
     /// Runs a command by id. Undoable commands record a history step when the workbook changed.
     /// Panics inside commands are caught and reported; the workbook is restored.
     pub fn execute(&mut self, id: &str, params: Json) -> Result<Json> {
+        // Editing together: undo and redo take back only this person's own steps.
+        if self.collab.is_some() && (id == "edit.undo" || id == "edit.redo") {
+            return self.collab_undo(id == "edit.redo");
+        }
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));

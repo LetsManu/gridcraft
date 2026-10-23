@@ -4599,3 +4599,35 @@ fn html_export_without_pictures_or_charts_has_no_fixed_geometry() {
     let html = crate::io::to_html(&s.doc().unwrap().wb, 0).unwrap();
     assert!(!html.contains("<colgroup>") && !html.contains("table-layout") && !html.contains("<svg") && !html.contains("<img"), "{html}");
 }
+
+/// OfficeHub: two people edit one workbook live; formulas follow the other's cells and undo only
+/// takes back one's own step.
+#[test]
+fn editing_together_merges_and_recalculates() {
+    let mut a = s();
+    a.execute("cell.set", json!({"cell": "A1", "input": "2"})).unwrap();
+    let seed = a.collab_seed(11);
+    let mut b = s();
+    b.collab_join(22, &[seed]).unwrap();
+    assert_eq!(v(&b, "A1"), Value::number(2.0));
+
+    // B writes a formula over A's cell, A changes the cell: both see the new result.
+    b.execute("cell.set", json!({"cell": "B1", "input": "=A1*10"})).unwrap();
+    let ub = b.collab_outgoing().unwrap();
+    a.collab_incoming(&ub).unwrap();
+    assert_eq!(v(&a, "B1"), Value::number(20.0));
+    a.execute("cell.set", json!({"cell": "A1", "input": "5"})).unwrap();
+    let ua = a.collab_outgoing().unwrap();
+    b.collab_incoming(&ua).unwrap();
+    assert_eq!(v(&b, "B1"), Value::number(50.0));
+    assert!(b.collab_outgoing().is_none(), "recalculated results are not sent back");
+
+    // A undoes: A1 is 2 again everywhere, B's formula stays.
+    a.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(v(&a, "A1"), Value::number(2.0));
+    assert_eq!(v(&a, "B1"), Value::number(20.0));
+    let ua = a.collab_outgoing().unwrap();
+    b.collab_incoming(&ua).unwrap();
+    assert_eq!(v(&b, "B1"), Value::number(20.0));
+    assert!(b.collab_presence().is_some());
+}

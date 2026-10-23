@@ -14,6 +14,7 @@ gridcraft-numfmt = { workspace = true }
 gridcraft-formula = { workspace = true }
 gridcraft-functions = { workspace = true }
 gridcraft-model = { workspace = true }
+gridcraft-collab = { workspace = true }
 gridcraft-calc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
