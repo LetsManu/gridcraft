@@ -180,6 +180,10 @@ pub struct GridState {
     pub wheel_zoom: Option<WheelZoom>,
     /// A one-finger touch drag in progress: it pans the sheet instead of selecting.
     pub touch_pan: bool,
+    /// When a finger last touched the screen (egui time, seconds): a tap is told from a click.
+    pub touch_at: Option<f64>,
+    /// A two-finger pinch in progress: the zoom it has reached, unrounded (percent).
+    pub pinch: Option<f32>,
 }
 
 /// Ctrl+wheel zoom for one (doc uid, sheet). egui eases a notch in over several frames and
@@ -610,7 +614,26 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     };
     // Scrolling.
     let (scroll_delta, zoom_delta, modifiers, now) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers, i.time));
-    if (resp.hovered() || resp.contains_pointer()) && !crate::text_box::contains_pointer(app, ui.ctx()) {
+    let (touching, multi_touch) = ui.input(|i| (i.any_touches(), i.multi_touch()));
+    if touching {
+        app.grid.touch_at = Some(now);
+    }
+    // Two fingers pinch the zoom smoothly, following the fingers (no steps as for a wheel).
+    let pinching = multi_touch.filter(|m| rect.contains(m.start_pos) || app.grid.pinch.is_some());
+    match pinching {
+        Some(m) => {
+            let z = (app.grid.pinch.unwrap_or(f32::from(sh.zoom)) * m.zoom_delta).clamp(10.0, 400.0);
+            if z.is_finite() {
+                app.grid.pinch = Some(z);
+                let percent = z.round() as u16;
+                if percent != sh.zoom {
+                    let _ = app.session.run("view.zoom", json!({"percent": percent}));
+                }
+            }
+        }
+        None => app.grid.pinch = None,
+    }
+    if pinching.is_none() && (resp.hovered() || resp.contains_pointer()) && !crate::text_box::contains_pointer(app, ui.ctx()) {
         if zoom_delta != 1.0 {
             // egui's zoom factor is e^(speed × points); one notch is `line_scroll_speed` points.
             let notch = ui.ctx().options(|o| o.input_options.scroll_zoom_speed * o.input_options.line_scroll_speed);
@@ -2422,13 +2445,16 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             app.grid.drag = Drag::Move { grab: c, to: None };
             return;
         }
-        // Double-click edits.
+        // Double-click edits; so does tapping the active cell again with a finger (a phone has
+        // no F2, and the on-screen keyboard appears only for an editor).
         let now = crate::now_ms();
-        if let Some((last, at)) = app.grid.last_click
-            && last == c
-            && now - at < 450.0
-            && !mods.shift
-        {
+        let tapped_again = primary_clicked
+            && !mods.any()
+            && app.grid.touch_at.is_some_and(|t| ctx.input(|i| i.time) - t < 1.0)
+            && sel.ranges.len() <= 1
+            && sh.merge_at(c).map_or(c, |m| m.start) == sel.active
+            && (sel.current().is_single() || sh.merge_at(c) == Some(sel.current()));
+        if tapped_again || (app.grid.last_click.is_some_and(|(last, at)| last == c && now - at < 450.0) && !mods.shift) {
             app.grid.last_click = None;
             // Following a hyperlink requires a single click in Excel; double-click edits.
             app.begin_edit(None, false);

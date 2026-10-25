@@ -107,7 +107,17 @@ pub fn start() {
                         });
                     }
                     let live = if app_bridge.is_none() { crate::live::Live::from_portal(opened) } else { None };
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs, portal_saves, saving: Vec::new(), live, sized: false }))
+                    Ok(Box::new(WebShell {
+                        app,
+                        inbox,
+                        bridge: app_bridge,
+                        prefs,
+                        portal_saves,
+                        saving: Vec::new(),
+                        live,
+                        sized: false,
+                        height: 0.0,
+                    }))
                 }),
             )
             .await;
@@ -145,6 +155,8 @@ struct WebShell {
     live: Option<crate::live::Live>,
     /// The view was fitted to a narrow screen (a phone) once.
     sized: bool,
+    /// The screen's height last frame (the on-screen keyboard changes it).
+    height: f32,
 }
 
 /// OfficeHub saves: the tickets started since the last frame and the ones the portal answered.
@@ -231,11 +243,23 @@ fn stored(key: &str) -> Option<String> {
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         fit_canvas(ctx);
-        if !self.sized && ctx.content_rect().width() > 1.0 {
+        let screen = ctx.content_rect();
+        if !self.sized && screen.width() > 1.0 {
             self.sized = true;
             // Like Excel on a phone: the ribbon folded, so the cells get the room.
-            if ctx.content_rect().width() < NARROW {
+            if screen.width() < NARROW {
                 self.app.ui.ribbon_collapsed = true;
+            }
+        }
+        // A phone: controls sized for a finger.
+        if screen.width() > 1.0 {
+            self.app.touch_layout = screen.width() < NARROW;
+        }
+        // The on-screen keyboard took (or gave back) room: keep the cell being edited in sight.
+        if (screen.height() - self.height).abs() > 1.0 {
+            self.height = screen.height();
+            if self.app.editor.is_some() {
+                self.app.grid.ensure_visible = true;
             }
         }
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));

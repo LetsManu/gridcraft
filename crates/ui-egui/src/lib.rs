@@ -299,6 +299,9 @@ pub struct SheetApp {
     /// The others editing this workbook together with this person (live co-editing), drawn as
     /// a coloured frame with their name on the cells they have selected.
     pub peers: Vec<RemotePeer>,
+    /// Laid out for a finger on a small screen (the web shell sets it on phones): a taller
+    /// formula bar with larger buttons and a narrower Name Box.
+    pub touch_layout: bool,
     /// Input held back for the next frame (see [`SheetApp::raw_input_hook`]).
     typed_ahead: Vec<egui::Event>,
     /// An editor was open at the last input hook.
@@ -385,6 +388,7 @@ impl SheetApp {
             started: now_ms(),
             allow_close: false,
             peers: Vec::new(),
+            touch_layout: false,
             typed_ahead: Vec::new(),
             editor_seen: false,
         }

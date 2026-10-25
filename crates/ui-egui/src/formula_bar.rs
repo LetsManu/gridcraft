@@ -14,7 +14,14 @@ const EDIT_KEYS: egui::EventFilter = egui::EventFilter { tab: true, horizontal_a
 pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let expanded = app.ui.formula_bar_expanded;
-    let h = if expanded { 72.0 } else { 30.0 };
+    // For a finger (phones): taller, with larger buttons and text.
+    let touch = app.touch_layout;
+    let (h, button, font) = match (expanded, touch) {
+        (false, false) => (30.0, 22.0, 13.0),
+        (true, false) => (72.0, 22.0, 13.0),
+        (false, true) => (44.0, 34.0, 16.0),
+        (true, true) => (104.0, 34.0, 16.0),
+    };
     egui::Panel::top("formula_bar")
         .exact_size(h)
         .frame(egui::Frame::NONE.fill(t.window).inner_margin(egui::Margin { left: 8, right: 8, top: 3, bottom: 3 }))
@@ -25,18 +32,18 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
                 let editing = app.editor.is_some();
                 let c = if editing { t.text } else { t.text_disabled };
-                if crate::widgets::icon_button(ui, Icon::Close, c, "Cancel", vec2(22.0, 22.0)).clicked() && editing {
+                if crate::widgets::icon_button(ui, Icon::Close, c, "Cancel", vec2(button, button)).clicked() && editing {
                     app.cancel_edit();
                 }
-                if crate::widgets::icon_button(ui, Icon::Check, c, "Enter", vec2(22.0, 22.0)).clicked() && editing {
+                if crate::widgets::icon_button(ui, Icon::Check, c, "Enter", vec2(button, button)).clicked() && editing {
                     app.commit_edit(0, 0, false, false);
                 }
-                if crate::widgets::icon_button(ui, Icon::Fx, t.text, "Insert Function", vec2(26.0, 22.0)).clicked() {
+                if crate::widgets::icon_button(ui, Icon::Fx, t.text, "Insert Function", vec2(button + 4.0, button)).clicked() {
                     app.open_dialog("insertFunction", json!({}));
                 }
                 ui.add_space(4.0);
                 // The formula field.
-                let avail = ui.available_width() - 24.0;
+                let avail = (ui.available_width() - button - 2.0).max(0.0);
                 let field = Rect::from_min_size(ui.cursor().min, vec2(avail, h - 6.0));
                 ui.painter().rect_filled(field, 4.0, t.input_bg);
                 ui.painter().rect_stroke(field, 4.0, Stroke::new(1.0, t.input_border), StrokeKind::Inside);
@@ -44,13 +51,13 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                 let id = egui::Id::new("gridcraft.formula_bar");
                 let read_only = active_spill_anchor(app).is_some();
                 if app.editor.is_some() {
-                    editor_widget(app, &mut child, id, theme::ui_font(13.0), expanded, field.width() - 12.0);
+                    editor_widget(app, &mut child, id, theme::ui_font(font), expanded, field.width() - 12.0);
                 } else {
                     // Show the active cell's content; clicking starts editing in the bar.
                     let text = active_input(app);
                     let color = if read_only { t.text_disabled } else { t.text };
                     let resp = child
-                        .add(egui::Label::new(egui::RichText::new(text).font(theme::ui_font(13.0)).color(color)).truncate().sense(Sense::click()));
+                        .add(egui::Label::new(egui::RichText::new(text).font(theme::ui_font(font)).color(color)).truncate().sense(Sense::click()));
                     let click = child.interact(field, id.with("click"), Sense::click());
                     if !read_only && (resp.clicked() || click.clicked()) {
                         app.begin_edit(None, true);
@@ -58,7 +65,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                 }
                 ui.allocate_space(vec2(avail, h - 6.0));
                 let chevron = if expanded { Icon::ChevronUp } else { Icon::Chevron };
-                if crate::widgets::icon_button(ui, chevron, t.text_dim, "Expand formula bar", vec2(20.0, 22.0)).clicked() {
+                if crate::widgets::icon_button(ui, chevron, t.text_dim, "Expand formula bar", vec2(button - 2.0, button)).clicked() {
                     app.ui.formula_bar_expanded = !app.ui.formula_bar_expanded;
                 }
             });
@@ -108,11 +115,15 @@ fn name_box(app: &mut SheetApp, ui: &mut egui::Ui, t: &Tokens) {
     let id = egui::Id::new("gridcraft.name_box");
     let shown = app.name_box_text();
     let mut text = app.name_box.clone().unwrap_or(shown.clone());
-    let rect = Rect::from_min_size(ui.cursor().min, vec2(118.0, 24.0));
+    // A phone keeps it narrow, so the formula field keeps room.
+    let (w, h, font) = if app.touch_layout { (76.0, 34.0, 16.0) } else { (118.0, 24.0, 13.0) };
+    let rect = Rect::from_min_size(ui.cursor().min, vec2(w, h));
     ui.painter().rect_filled(rect, 4.0, t.input_bg);
     ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, t.input_border), StrokeKind::Inside);
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(rect.min + vec2(6.0, 3.0), vec2(96.0, 18.0))));
-    let resp = child.add(TextEdit::singleline(&mut text).id(id).frame(egui::Frame::NONE).font(theme::ui_font(13.0)).desired_width(96.0));
+    let text_h = font + 5.0;
+    let mut child =
+        ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(rect.min + vec2(6.0, (h - text_h) / 2.0), vec2(w - 22.0, text_h))));
+    let resp = child.add(TextEdit::singleline(&mut text).id(id).frame(egui::Frame::NONE).font(theme::ui_font(font)).desired_width(w - 22.0));
     if resp.gained_focus() {
         app.name_box = Some(shown.clone());
     }
@@ -143,11 +154,11 @@ fn name_box(app: &mut SheetApp, ui: &mut egui::Ui, t: &Tokens) {
         }
         app.name_box = None;
     }
-    ui.allocate_space(vec2(118.0, 24.0));
+    ui.allocate_space(vec2(w, h));
     // Dropdown of names.
     let names: Vec<String> =
         app.session.active().map(|d| d.wb.names.iter().filter(|n| !n.hidden).map(|n| n.name.clone()).collect()).unwrap_or_default();
-    let mb = Rect::from_min_size(pos2(rect.right() - 16.0, rect.top() + 4.0), vec2(14.0, 16.0));
+    let mb = Rect::from_min_size(pos2(rect.right() - 16.0, rect.center().y - 8.0), vec2(14.0, 16.0));
     icons::paint(ui.painter(), mb, Icon::Chevron, t.text_dim);
     let r = ui.interact(mb, id.with("drop"), Sense::click());
     egui::Popup::menu(&r).show(|ui| {
