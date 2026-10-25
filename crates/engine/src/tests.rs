@@ -4631,3 +4631,252 @@ fn editing_together_merges_and_recalculates() {
     assert_eq!(v(&b, "B1"), Value::number(20.0));
     assert!(b.collab_presence().is_some());
 }
+
+/// Sends what `from` changed to `to`; returns the update's size (0: nothing to send).
+fn sync(from: &mut Session, to: &mut Session) -> usize {
+    match from.collab_outgoing() {
+        Some(u) => {
+            to.collab_incoming(&u).unwrap();
+            u.len()
+        }
+        None => 0,
+    }
+}
+
+fn sheet_of(s: &Session, i: usize) -> std::sync::Arc<gridcraft_model::Sheet> {
+    s.doc().unwrap().wb.sheets[i].clone()
+}
+
+/// OfficeHub: everything one person does while editing together reaches the other and survives
+/// further edits on both sides: objects, notes, merges, sizes, sheets, formats, names, rules.
+#[test]
+fn editing_together_shares_objects_formats_and_sheets() {
+    use crate::io::base64_encode;
+    let mut a = s();
+    for (cell, input) in [("A1", "Item"), ("B1", "Sales"), ("A2", "x"), ("B2", "3"), ("A3", "y"), ("B3", "5")] {
+        a.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+    }
+    let seed = a.collab_seed(11);
+    let mut b = s();
+    b.collab_join(22, &[seed]).unwrap();
+
+    // A chart and a floating picture.
+    a.execute("insert.chart", json!({"range": "A1:B3", "type": "column", "at": "D2"})).unwrap();
+    a.execute("selection.set", json!({"range": "F10"})).unwrap();
+    a.execute("insert.picture", json!({"base64": base64_encode(&tiny_png())})).unwrap();
+    a.execute("insert.picture", json!({"base64": base64_encode(&tiny_png()), "placement": "cell", "at": "G1"})).unwrap();
+    sync(&mut a, &mut b);
+    let sb = sheet_of(&b, 0);
+    assert_eq!(sb.cell_pictures.get(&CellRef::parse("G1").unwrap()).map(|p| p.data.clone()), Some(tiny_png()), "a picture in a cell arrives");
+    assert_eq!(sb.charts.len(), 1, "the chart arrives");
+    assert_eq!(sb.images.len(), 1, "the picture arrives");
+    assert_eq!(*sb.images[0].data, tiny_png());
+
+    // Note, merge, sizes.
+    a.execute("review.newNote", json!({"cell": "B2", "text": "check this"})).unwrap();
+    a.execute("home.mergeCells", json!({"range": "A5:C5"})).unwrap();
+    a.execute("home.columnWidth", json!({"cols": "B:B", "width": 120})).unwrap();
+    a.execute("home.rowHeight", json!({"rows": "3:3", "height": 40})).unwrap();
+    sync(&mut a, &mut b);
+    let sb = sheet_of(&b, 0);
+    assert_eq!(sb.comments.get(&CellRef::parse("B2").unwrap()).map(|c| c.text.as_str()), Some("check this"));
+    assert_eq!(sb.merges, vec![gridcraft_core::RangeRef::parse("A5:C5").unwrap()]);
+    assert_eq!(sb.cols.get(&1).map(|c| c.size), sheet_of(&a, 0).cols.get(&1).map(|c| c.size));
+    assert!(sb.cols.get(&1).is_some_and(|c| c.size.is_some()));
+    assert_eq!(sb.rows.get(&2).map(|r| r.size), sheet_of(&a, 0).rows.get(&2).map(|r| r.size));
+
+    // Number format and fill on a range (B edits this time).
+    b.execute("home.numberFormat", json!({"range": "B2:B3", "code": "0.00"})).unwrap();
+    b.execute("home.fillColor", json!({"range": "A2:B3", "color": "#FFFF00"})).unwrap();
+    sync(&mut b, &mut a);
+    let da = a.doc().unwrap();
+    let st = da.wb.styles.get(da.wb.active().unwrap().style_id(CellRef::parse("B3").unwrap()));
+    assert_eq!(st.num_fmt.as_str(), "0.00");
+    assert!(st.fill != gridcraft_model::Style::default().fill, "the fill arrives");
+    let st = da.wb.styles.get(da.wb.active().unwrap().style_id(CellRef::parse("A2").unwrap()));
+    assert!(st.fill != gridcraft_model::Style::default().fill);
+    // A whole column's format (kept on the column, its style in each person's own style table).
+    b.execute("home.fillColor", json!({"range": "H:H", "color": "#00FF00"})).unwrap();
+    let fill_b = {
+        let d = b.doc().unwrap();
+        d.wb.styles.get(d.wb.active().unwrap().style_id(CellRef::parse("H40").unwrap())).fill
+    };
+    assert!(fill_b != gridcraft_model::Style::default().fill);
+    sync(&mut b, &mut a);
+    let da = a.doc().unwrap();
+    assert_eq!(da.wb.styles.get(da.wb.active().unwrap().style_id(CellRef::parse("H40").unwrap())).fill, fill_b);
+
+    // A defined name and conditional formatting.
+    b.execute("formulas.defineName", json!({"name": "Total", "refersTo": "=Sheet1!$B$2:$B$3"})).unwrap();
+    b.execute(
+        "home.conditionalFormat",
+        json!({"range": "B2:B3", "rule": {"type": "cellIs", "operator": "greaterThan", "value": "4", "preset": "lightRedFill"}}),
+    )
+    .unwrap();
+    b.execute("cell.set", json!({"cell": "C1", "input": "=SUM(Total)"})).unwrap();
+    sync(&mut b, &mut a);
+    assert!(a.doc().unwrap().wb.names.iter().any(|n| n.name == "Total"));
+    assert_eq!(sheet_of(&a, 0).cond_formats.len(), 1);
+    assert_eq!(v(&a, "C1"), Value::number(8.0));
+
+    // A new sheet, renamed and moved in front.
+    a.execute("home.insertSheet", json!({"name": "Plan"})).unwrap();
+    a.execute("cell.set", json!({"cell": "A1", "input": "planned"})).unwrap();
+    sync(&mut a, &mut b);
+    a.execute("sheet.rename", json!({"sheet": 1, "name": "Budget"})).unwrap();
+    sync(&mut a, &mut b);
+    a.execute("sheet.move", json!({"sheet": 1, "to": 0})).unwrap();
+    sync(&mut a, &mut b);
+    let names = |s: &Session| s.doc().unwrap().wb.sheets.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&b), vec!["Budget", "Sheet1"]);
+    assert_eq!(sheet_of(&b, 0).value(CellRef::parse("A1").unwrap()), Value::text("planned"));
+    // Everything from before is still on the first sheet, now second.
+    let sb = sheet_of(&b, 1);
+    assert_eq!((sb.charts.len(), sb.images.len(), sb.comments.len(), sb.merges.len(), sb.cond_formats.len()), (1, 1, 1, 1, 1));
+    // B keeps editing the moved sheet: it lands on A's same sheet.
+    b.execute("sheet.activate", json!({"sheet": 1})).unwrap();
+    b.execute("cell.set", json!({"cell": "B3", "input": "7"})).unwrap();
+    sync(&mut b, &mut a);
+    assert_eq!(sheet_of(&a, 1).value(CellRef::parse("B3").unwrap()), Value::number(7.0));
+    assert_eq!(names(&a), names(&b));
+
+    // A third person joining later gets all of it.
+    let mut c = s();
+    c.collab_join(33, &[a.collab_state().unwrap()]).unwrap();
+    assert_eq!(names(&c), vec!["Budget", "Sheet1"]);
+    let sc = sheet_of(&c, 1);
+    assert_eq!((sc.charts.len(), sc.images.len(), sc.comments.len(), sc.merges.len(), sc.cond_formats.len()), (1, 1, 1, 1, 1));
+    assert!(c.doc().unwrap().wb.names.iter().any(|n| n.name == "Total"));
+}
+
+/// A picture is sent once: later edits on its sheet, or moving it, don't send it again; a later
+/// participant still gets it.
+#[test]
+fn editing_together_sends_a_picture_only_when_it_changes() {
+    use crate::io::base64_encode;
+    let mut a = s();
+    let seed = a.collab_seed(11);
+    let mut b = s();
+    b.collab_join(22, &[seed]).unwrap();
+    // A picture of about 200 KB (noise does not compress).
+    let mut big = image::RgbaImage::new(256, 200);
+    let mut x: u32 = 7;
+    for p in big.pixels_mut() {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        *p = image::Rgba([(x >> 8) as u8, (x >> 16) as u8, (x >> 24) as u8, 255]);
+    }
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(big).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    assert!(png.len() > 100_000);
+    a.execute("insert.picture", json!({"base64": base64_encode(&png)})).unwrap();
+    let sent = sync(&mut a, &mut b);
+    assert!(sent > png.len(), "the picture itself is sent once ({sent} bytes)");
+    assert_eq!(*sheet_of(&b, 0).images[0].data, png);
+    for i in 0..5 {
+        a.execute("cell.set", json!({"cell": "A1", "input": format!("{i}")})).unwrap();
+        let sent = sync(&mut a, &mut b);
+        assert!(sent < 2_000, "a cell edit next to the picture stays small ({sent} bytes)");
+        b.execute("cell.set", json!({"cell": "B1", "input": format!("{i}")})).unwrap();
+        let sent = sync(&mut b, &mut a);
+        assert!(sent < 2_000, "the other person's edit does not send the picture back ({sent} bytes)");
+    }
+    // Moving the picture sends its position, and the picture still arrives intact.
+    a.execute("selection.set", json!({"range": "C5"})).unwrap();
+    let id = sheet_of(&a, 0).images[0].id;
+    a.execute("object.move", json!({"kind": "image", "id": id, "at": "C5"})).unwrap();
+    let sent = sync(&mut a, &mut b);
+    assert!(sent < 2_000, "moving the picture sends its place, not its bytes ({sent} bytes)");
+    assert_eq!(sheet_of(&b, 0).images[0].anchor, sheet_of(&a, 0).images[0].anchor);
+    assert_eq!(*sheet_of(&b, 0).images[0].data, png);
+    // B copies it (same bytes): only the reference travels. A newcomer gets both.
+    b.execute("insert.picture", json!({"base64": base64_encode(&png), "at": "J2"})).unwrap();
+    let sent = sync(&mut b, &mut a);
+    assert!(sent < 2_000, "the same picture again sends a reference ({sent} bytes)");
+    let mut c = s();
+    c.collab_join(33, &[a.collab_state().unwrap()]).unwrap();
+    let sc = sheet_of(&c, 0);
+    assert_eq!(sc.images.len(), 2);
+    assert!(sc.images.iter().all(|i| *i.data == png));
+}
+
+/// Two people insert and delete rows at the same time: the cells merge (the last writer wins a
+/// cell), nothing panics, no sheet is lost, and both end up with the same workbook.
+#[test]
+fn editing_together_survives_rows_inserted_and_deleted_at_once() {
+    let mut a = s();
+    for r in 1..=10 {
+        a.execute("cell.set", json!({"cell": format!("A{r}"), "input": format!("{r}")})).unwrap();
+    }
+    a.execute("home.insertSheet", json!({"name": "Second"})).unwrap();
+    a.execute("sheet.activate", json!({"sheet": 0})).unwrap();
+    let seed = a.collab_seed(11);
+    let mut b = s();
+    b.collab_join(22, &[seed]).unwrap();
+    // At the same time: A inserts two rows above row 3, B deletes rows 5 to 6 and types below.
+    a.execute("home.insertRows", json!({"rows": "3:4"})).unwrap();
+    b.execute("home.deleteRows", json!({"rows": "5:6"})).unwrap();
+    b.execute("cell.set", json!({"cell": "B9", "input": "=SUM(A1:A8)"})).unwrap();
+    let ua = a.collab_outgoing().unwrap();
+    let ub = b.collab_outgoing().unwrap();
+    a.collab_incoming(&ub).unwrap();
+    b.collab_incoming(&ua).unwrap();
+    // Both converge on the same cells, and both sheets are still there.
+    let dump = |s: &Session| {
+        let sh = sheet_of(s, 0);
+        (1..=14).map(|r| sh.cells.get(CellRef::new(r - 1, 0)).map(|c| c.value.clone())).collect::<Vec<_>>()
+    };
+    assert_eq!(dump(&a), dump(&b));
+    let names = |s: &Session| s.doc().unwrap().wb.sheets.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&a), vec!["Sheet1", "Second"]);
+    assert_eq!(names(&a), names(&b));
+    assert_eq!(v(&a, "B9"), v(&b, "B9"));
+    // Both keep working.
+    a.execute("cell.set", json!({"cell": "C1", "input": "go on"})).unwrap();
+    sync(&mut a, &mut b);
+    assert_eq!(v(&b, "C1"), Value::text("go on"));
+}
+
+/// Two people add a sheet at the same time (both called "Sheet2"): both sheets stay, with names
+/// that differ, the same for both, and a sheet deleted meanwhile stays deleted.
+#[test]
+fn editing_together_keeps_sheets_added_at_the_same_time() {
+    let mut a = s();
+    a.execute("home.insertSheet", json!({"name": "Old"})).unwrap();
+    a.execute("sheet.activate", json!({"sheet": 0})).unwrap();
+    let seed = a.collab_seed(11);
+    let mut b = s();
+    b.collab_join(22, &[seed]).unwrap();
+    a.execute("home.insertSheet", json!({})).unwrap();
+    a.execute("cell.set", json!({"cell": "A1", "input": "from a"})).unwrap();
+    b.execute("home.insertSheet", json!({})).unwrap();
+    b.execute("cell.set", json!({"cell": "A1", "input": "from b"})).unwrap();
+    b.execute("home.deleteSheet", json!({"sheet": 2})).unwrap();
+    let ua = a.collab_outgoing().unwrap();
+    let ub = b.collab_outgoing().unwrap();
+    a.collab_incoming(&ub).unwrap();
+    b.collab_incoming(&ua).unwrap();
+    let names = |s: &Session| s.doc().unwrap().wb.sheets.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+    let na = names(&a);
+    assert_eq!(na, names(&b));
+    assert!(!na.contains(&"Old".to_string()), "{na:?}");
+    assert_eq!(na.len(), 3, "{na:?}");
+    let mut unique = na.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "{na:?}");
+    let texts = |s: &Session| {
+        let mut t: Vec<Value> = s.doc().unwrap().wb.sheets.iter().map(|x| x.value(CellRef::parse("A1").unwrap())).collect();
+        t.sort_by_key(|v| format!("{v:?}"));
+        t
+    };
+    assert_eq!(texts(&a), texts(&b));
+    assert!(texts(&a).contains(&Value::text("from a")) && texts(&a).contains(&Value::text("from b")));
+    // Later edits keep both in step.
+    b.execute("sheet.activate", json!({"sheet": 2})).unwrap();
+    b.execute("cell.set", json!({"cell": "B2", "input": "1"})).unwrap();
+    sync(&mut b, &mut a);
+    a.execute("cell.set", json!({"cell": "C3", "input": "2"})).unwrap();
+    sync(&mut a, &mut b);
+    assert_eq!(names(&a), names(&b));
+    assert_eq!(sheet_of(&a, 2).value(CellRef::parse("B2").unwrap()), Value::number(1.0));
+}

@@ -14,6 +14,10 @@
 //! | `book` | a [`Workbook`] field (defined names, theme, calculation settings…) | that field as JSON |
 //! | `props` | `<sheet id>\t<field>` | a [`Sheet`] field (name, column widths, merges, charts…) as JSON |
 //! | `cells` | `<sheet id>\t<A1>` | the cell as JSON: input (formula or constant) and its style |
+//! | `blobs` | `<sha-256>` | a picture's bytes (base64); pictures in `props` refer to it as `blob:<sha-256>` |
+//!
+//! A picture's bytes travel once, under their hash: moving or resizing a picture, or any other
+//! edit on its sheet, sends only the reference.
 //!
 //! What only concerns one person's view (scroll position, active cell, zoom, the active sheet) is
 //! not shared. Formula results are not shared either: every participant calculates them.
@@ -66,6 +70,7 @@ pub struct Collab {
     book: MapRef,
     props: MapRef,
     cells: MapRef,
+    blobs: MapRef,
     client: u64,
     next_sheet: u64,
     /// The workbook as last written to or read from the shared document.
@@ -132,12 +137,135 @@ fn cell_from(json: &str, wb: &mut Workbook) -> Option<Cell> {
     Some(cell)
 }
 
-/// The shared fields of a sheet, each as JSON.
-fn sheet_fields(s: &Sheet) -> Vec<(String, String)> {
+/// Sheet fields that can hold large data (pictures): written only when they changed, so an edit
+/// elsewhere on the sheet doesn't encode them again.
+fn heavy_unchanged(s: &Sheet, prev: &Sheet) -> [(&'static str, bool); 4] {
+    [
+        ("images", s.images == prev.images),
+        ("cell_pictures", s.cell_pictures == prev.cell_pictures),
+        ("shapes", s.shapes == prev.shapes),
+        ("charts", s.charts == prev.charts),
+    ]
+}
+
+/// Row and column settings (`cols`, `rows`) refer to a style by its id in this participant's style
+/// table: share the style itself instead.
+fn lines_out(v: &mut Json, wb: &Workbook) {
+    let Json::Object(lines) = v else { return };
+    for line in lines.values_mut() {
+        if let Some(slot) = line.get_mut("style")
+            && let Some(id) = slot.as_u64().and_then(|n| u32::try_from(n).ok())
+        {
+            *slot = serde_json::to_value(wb.styles.get(StyleId(id))).unwrap_or(Json::Null);
+        }
+    }
+}
+
+/// Shared row and column settings back to this participant's style ids (interned in `wb`).
+fn lines_in(v: &mut Json, wb: &mut Workbook) {
+    let Json::Object(lines) = v else { return };
+    for line in lines.values_mut() {
+        if let Some(slot) = line.get_mut("style")
+            && slot.is_object()
+        {
+            *slot = match serde_json::from_value::<Style>(slot.clone()) {
+                Ok(style) => json!(wb.styles.intern(style).0),
+                Err(_) => Json::Null,
+            };
+        }
+    }
+}
+
+/// Fields whose pictures' bytes travel as blobs.
+const BLOB_FIELDS: &[&str] = &["images", "cell_pictures"];
+/// Shorter base64 data stays inline.
+const BLOB_MIN: usize = 128;
+
+fn sha256_hex(data: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(data.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Moves every long `data` string in `v` into `blobs` (hash, base64), leaving `blob:<hash>`.
+fn blobs_out(v: &mut Json, blobs: &mut Vec<(String, String)>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match v {
+        Json::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if k == "data"
+                    && let Json::String(data) = x
+                    && data.len() >= BLOB_MIN
+                {
+                    let hash = sha256_hex(data);
+                    blobs.push((hash.clone(), std::mem::take(data)));
+                    *x = Json::String(format!("blob:{hash}"));
+                } else {
+                    blobs_out(x, blobs, depth + 1);
+                }
+            }
+        }
+        Json::Array(a) => a.iter_mut().for_each(|x| blobs_out(x, blobs, depth + 1)),
+        _ => {}
+    }
+}
+
+/// Puts the bytes back for every `blob:<hash>` in `v` (a missing blob becomes an empty picture).
+fn blobs_in<T: ReadTxn>(v: &mut Json, blobs: &MapRef, txn: &T, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match v {
+        Json::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if k == "data"
+                    && let Json::String(data) = x
+                    && let Some(hash) = data.strip_prefix("blob:")
+                {
+                    *data = blobs.get(txn, hash).and_then(text).map(|s| s.to_string()).unwrap_or_default();
+                } else {
+                    blobs_in(x, blobs, txn, depth + 1);
+                }
+            }
+        }
+        Json::Array(a) => a.iter_mut().for_each(|x| blobs_in(x, blobs, txn, depth + 1)),
+        _ => {}
+    }
+}
+
+/// The shared fields of a sheet, each as JSON, and the pictures' bytes they refer to. With `prev`
+/// (the sheet as last synced), large fields that did not change are left out.
+fn sheet_fields(s: &Sheet, prev: Option<&Sheet>, wb: &Workbook, blobs: &mut Vec<(String, String)>) -> Vec<(String, String)> {
     let mut q = s.clone();
     q.cells = CellStore::new();
+    let mut skip: Vec<&str> = SHEET_SKIP.to_vec();
+    if let Some(p) = prev {
+        for (field, same) in heavy_unchanged(s, p) {
+            if same {
+                skip.push(field);
+                match field {
+                    "images" => q.images = Vec::new(),
+                    "cell_pictures" => q.cell_pictures = Default::default(),
+                    "shapes" => q.shapes = Vec::new(),
+                    _ => q.charts = Vec::new(),
+                }
+            }
+        }
+    }
     let Ok(Json::Object(m)) = serde_json::to_value(&q) else { return Vec::new() };
-    m.into_iter().filter(|(k, _)| !SHEET_SKIP.contains(&k.as_str())).filter_map(|(k, v)| serde_json::to_string(&v).ok().map(|s| (k, s))).collect()
+    m.into_iter()
+        .filter(|(k, _)| !skip.contains(&k.as_str()))
+        .filter_map(|(k, mut v)| {
+            if k == "cols" || k == "rows" {
+                lines_out(&mut v, wb);
+            }
+            if BLOB_FIELDS.contains(&k.as_str()) {
+                blobs_out(&mut v, blobs, 0);
+            }
+            serde_json::to_string(&v).ok().map(|s| (k, s))
+        })
+        .collect()
 }
 
 /// The shared fields of a workbook, each as JSON.
@@ -149,14 +277,19 @@ fn book_fields(wb: &Workbook) -> Vec<(String, String)> {
     m.into_iter().filter(|(k, _)| !BOOK_SKIP.contains(&k.as_str())).filter_map(|(k, v)| serde_json::to_string(&v).ok().map(|s| (k, s))).collect()
 }
 
-/// `sheet` with the shared `fields` replaced (the cells and this person's view stay).
-fn patch_sheet(sheet: &Sheet, fields: &[(String, Json)]) -> Result<Sheet> {
+/// `sheet` with the shared `fields` replaced (the cells and this person's view stay); styles the
+/// fields carry are interned in `wb`.
+fn patch_sheet(sheet: &Sheet, fields: &[(String, Json)], wb: &mut Workbook) -> Result<Sheet> {
     let mut q = sheet.clone();
     let cells = std::mem::take(&mut q.cells);
     let mut v = serde_json::to_value(&q).map_err(|e| CollabError::Shape(e.to_string()))?;
     if let Json::Object(m) = &mut v {
         for (k, val) in fields {
-            m.insert(k.clone(), val.clone());
+            let mut val = val.clone();
+            if k == "cols" || k == "rows" {
+                lines_in(&mut val, wb);
+            }
+            m.insert(k.clone(), val);
         }
     }
     let mut out: Sheet = serde_json::from_value(v).map_err(|e| CollabError::Shape(e.to_string()))?;
@@ -209,6 +342,7 @@ impl Collab {
         let book = doc.get_or_insert_map("book");
         let props = doc.get_or_insert_map("props");
         let cells = doc.get_or_insert_map("cells");
+        let blobs = doc.get_or_insert_map("blobs");
         let mut undo = UndoManager::with_options(UndoOptions {
             capture_timeout_millis: u64::MAX,
             tracked_origins: [Origin::from(LOCAL)].into_iter().collect(),
@@ -220,7 +354,7 @@ impl Collab {
         for m in [&book, &props, &cells] {
             undo.expand_scope(&doc, m);
         }
-        Collab { doc, book, props, cells, client, next_sheet: 0, synced: None, ids: Vec::new(), seen: HashMap::new(), undo }
+        Collab { doc, book, props, cells, blobs, client, next_sheet: 0, synced: None, ids: Vec::new(), seen: HashMap::new(), undo }
     }
 
     /// The first participant fills the shared document with the workbook it opened.
@@ -364,8 +498,15 @@ impl Collab {
                 if prev.is_some_and(|p| Arc::ptr_eq(p, sheet)) {
                     continue;
                 }
-                for (k, v) in sheet_fields(sheet) {
+                let mut new_blobs = Vec::new();
+                for (k, v) in sheet_fields(sheet, prev.map(|p| &**p), wb, &mut new_blobs) {
                     self.put(&mut txn, &props, "props", &format!("{id}{SEP}{k}"), v);
+                }
+                for (hash, data) in new_blobs {
+                    // Content-addressed: a blob already there (sent by anyone) is the same bytes.
+                    if self.blobs.get(&txn, &hash).is_none() {
+                        self.blobs.insert(&mut txn, hash, Any::String(Arc::from(data)));
+                    }
                 }
                 let changed: Vec<CellRef> = match prev {
                     Some(p) => p.cells.diff(&sheet.cells),
@@ -482,8 +623,11 @@ impl Collab {
             let same = self.seen.get(&key).is_some_and(|old| Arc::ptr_eq(old, &s) || *old == s);
             if let Some((sheet, field)) = split(k)
                 && (!same || by_name)
-                && let Ok(value) = serde_json::from_str::<Json>(&s)
+                && let Ok(mut value) = serde_json::from_str::<Json>(&s)
             {
+                if BLOB_FIELDS.contains(&field) {
+                    blobs_in(&mut value, &self.blobs, &txn, 0);
+                }
                 sheet_props.entry(sheet.to_string()).or_default().push((field.to_string(), value));
             }
             touched.insert(key.clone());
@@ -512,9 +656,22 @@ impl Collab {
             }
         }
 
-        // The sheets, in the shared order.
+        // The sheets, in the shared order. Two people adding a sheet at the same time each write
+        // an order without the other's sheet and one order wins: every sheet that exists (has a
+        // name) is kept, one deleted meanwhile is dropped.
         if order.is_empty() {
             order = self.ids.clone();
+        }
+        let mut named: Vec<String> = self.props.keys(&txn).filter_map(|k| k.strip_suffix("\tname").map(str::to_string)).collect();
+        named.sort();
+        if !named.is_empty() {
+            order.retain(|id| named.binary_search(id).is_ok());
+            let mut seen_ids: HashSet<String> = order.iter().cloned().collect();
+            for id in named {
+                if seen_ids.insert(id.clone()) {
+                    order.push(id);
+                }
+            }
         }
         let old_sheets = std::mem::take(&mut wb.sheets);
         let mut sheets: Vec<Arc<Sheet>> = Vec::with_capacity(order.len());
@@ -546,7 +703,7 @@ impl Collab {
             };
             if !props.is_empty() {
                 changed.structure = true;
-                sheet = Arc::new(patch_sheet(&sheet, &props)?);
+                sheet = Arc::new(patch_sheet(&sheet, &props, &mut wb)?);
             }
             if let Some(cells) = sheet_cells.remove(id) {
                 let s = Arc::make_mut(&mut sheet);
@@ -562,6 +719,25 @@ impl Collab {
                 }
             }
             sheets.push(sheet);
+        }
+        // Two sheets added at the same time may share a name: the later one gets a number, the
+        // same on every participant (the order is the same everywhere).
+        let mut names: HashSet<String> = HashSet::new();
+        for sheet in &mut sheets {
+            if names.insert(sheet.name.to_lowercase()) {
+                continue;
+            }
+            let base = sheet.name.clone();
+            for n in 2..1000u32 {
+                let suffix = format!(" ({n})");
+                let keep = 31usize.saturating_sub(suffix.chars().count());
+                let candidate = format!("{}{suffix}", base.chars().take(keep).collect::<String>());
+                if names.insert(candidate.to_lowercase()) {
+                    Arc::make_mut(sheet).name = candidate;
+                    changed.structure = true;
+                    break;
+                }
+            }
         }
         if sheets.is_empty() {
             // Never leave a workbook without sheets.
