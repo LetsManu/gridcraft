@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-23 · **Change:** minor (live co-editing crate `collab`) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-25 · **Change:** minor (co-editing: styles of rows/columns, picture blobs, concurrent sheets) · **Target:** Microsoft Excel (Microsoft 365)
 
 How GridCraft is built today. Rules for contributors are in [`AGENTS.md`](../AGENTS.md).
 
@@ -56,6 +56,10 @@ recalculates only the cells it touched (all cells when sheets changed). A cell t
 formula (or constant) and its style by value; calculated results stay local. While editing
 together, Undo/Redo use the CRDT's undo manager, so they take back only this person's own steps.
 The transport is the host's: the web app's `live.rs` talks to OfficeHub's relay (`?collab=`).
+Row and column settings carry their style by value too; pictures' bytes go into a `blobs` map
+under their SHA-256 (sent once, referenced as `blob:<hash>`), and large sheet fields are encoded
+only when they changed. Every sheet with a shared name is kept even when two people's sheet
+orders raced, and equal names get a number, the same on every participant.
 
 ## Agent control
 
@@ -82,6 +86,7 @@ rpm, tarball), FreeBSD, and web (WASM; WebGPU or WebGL2). Release workflows in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-25 | minor | Co-editing: row/column styles by value, picture blobs by hash, sheets added at the same time kept |
 | 2026-10-23 | minor | Live co-editing: `collab` crate, `Session::collab_*`, OfficeHub transport |
 | 2026-10-14 | minor | Document Undo's retained-cell-storage budget and latest-step guarantee |
 | 2026-10-10 | major | Created from the code on main: crates, layers, data flow, agent control, known gaps |

@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-22 · **Change:** trivial (progress log: formula hardening, #2163/#2162; previously minor: Page Setup paper sizes: JIS B4/B5/B6, the Japanese postcards and envelopes, and A6; long flat operator chains up to Excel's formula limit) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-25 · **Change:** minor (editing together syncs every kind of change; touch editing on a phone; previously trivial: progress log: formula hardening, #2163/#2162; previously minor: Page Setup paper sizes: JIS B4/B5/B6, the Japanese postcards and envelopes, and A6; long flat operator chains up to Excel's formula limit) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -135,6 +135,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-25 | Editing together syncs everything and works on a phone (OfficeHub build): whole-column and whole-row formats travel as styles (they carried the sender's style ids), two sheets added at the same time are both kept (one used to vanish) with distinct names, and a picture's bytes travel once under their hash (moving it or editing next to it sends only a reference); tests cover charts, pictures, notes, merges, sizes, formats, names, conditional formatting, sheet insert/rename/move and rows inserted and deleted at once. On a phone a second tap on the active cell edits it with the on-screen keyboard, pinch zooms smoothly, the formula bar is sized for a finger and the edited cell stays above the keyboard |
 | 2026-10-23 | Editing together, live (OfficeHub build): new `gridcraft-collab` crate shares each cell (formula or value, style by value), sheet properties and workbook fields as Yjs maps; edits to different cells merge, the same cell goes to the last writer, formulas recalculate where they land and undo takes back only your own steps. The web app opens a workbook from the portal (`?src=`), saves back with Ctrl+S (`?save=`), joins the live session (`?collab=`), autosaves once everyone pauses and shows the others' selected cells with their names |
 | 2026-10-22 | Formula hardening: digits too many for a finite number are text, so `"1 <400 digits>/<400 digits>"` no longer coerces to NaN; a NaN column index in VLOOKUP, HLOOKUP and the D-functions is `#VALUE!` instead of an index underflow; REGEXREPLACE stops building a result as soon as it can only be too long (a worst case went from 1 GB to 7 MB) (#2163, #2162) |
 | 2026-10-21 | Page Setup paper sizes match Japanese Excel: `B4`/`B5`/`B6` are the JIS sizes (ISO B4/B5/B6 stay reachable by name), so a Japanese B5 worksheet prints at 182×257 mm; Japanese Postcard (100×148 mm), Double Postcard (148×200 mm), Envelope #3/#4 (120×235/90×205 mm), Kaku #2/#3 (240×332/216×277 mm) and A6 are added, both sizes reach the PDF page (`file.exportPdf`/`file.print` MediaBox) and the size survives an XLSX round-trip; the Page Layout Size menu lists them. `B4`/`B5` used to be the ISO sizes, which is changed here |
@@ -222,6 +223,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-25 | minor | Progress log: editing together syncs everything; editing on a phone |
 | 2026-10-22 | trivial | Progress log: formula hardening (#2163, #2162) |
 | 2026-10-21 | minor | Page Setup paper sizes: JIS B4/B5/B6 (ISO by name), Japanese postcards and envelopes, A6; PDF page size follows, XLSX round-trips |
 | 2026-10-20 | minor | Dutch (nl) listed under other shipped languages; progress log row |
